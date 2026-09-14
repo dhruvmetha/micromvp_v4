@@ -87,6 +87,16 @@ class SerialActionSender:
         self._pending_alive_ids: List[int] = []  # Collects IDs until STATUS line
         self._previous_alive_ids: set = set()  # Track previous alive IDs for connect/disconnect events
 
+        # Throttled write-error logging. Without this a hiccup on the
+        # ESP32 USB-JTAG path floods the log at the 30 Hz send rate.
+        # Strategy: print first occurrence and then a periodic summary
+        # ("N timeouts in the last T seconds") so the failure mode is
+        # still visible without the spam.
+        self._write_err_count: int = 0
+        self._write_err_window_start: float = 0.0
+        self._write_err_last_print: float = 0.0
+        self._write_err_summary_interval_sec: float = 5.0
+
     def start(self) -> bool:
         """Start the serial connection and sender thread."""
         if self._running:
@@ -97,7 +107,12 @@ class SerialActionSender:
                 port=self._config.port,
                 baudrate=self._config.baudrate,
                 timeout=0.1,
-                write_timeout=0.1
+                # write_timeout was 0.1s but the ESP32 USB-JTAG path can lag
+                # briefly under load and the per-send window is only ~33 ms
+                # (30 Hz). 0.5 s gives the OS write buffer plenty of room
+                # to drain while still bounding latency so a truly stuck
+                # serial doesn't block forever.
+                write_timeout=0.5,
             )
             print(f"[SerialSender] Port {self._config.port} opened at {self._config.baudrate}")
         except serial.SerialException as e:
@@ -274,13 +289,18 @@ class SerialActionSender:
             disconnections = self._previous_alive_ids - current_ids
 
             with self._status_lock:
-                # Add connection events
+                # Add connection events (and surface them on stdout so anyone
+                # tailing the run log can see live connectivity changes — the
+                # GUI sidebar already shows recent_events but the log didn't.)
                 for robot_id in sorted(new_connections):
-                    self._add_event(f"[INFO] Car {robot_id} connected")
+                    msg = f"[SerialSender] Car {robot_id} CONNECTED (alive now: {sorted(current_ids)})"
+                    self._add_event(msg)
+                    print(msg, flush=True)
 
-                # Add disconnection events
                 for robot_id in sorted(disconnections):
-                    self._add_event(f"[INFO] Car {robot_id} disconnected")
+                    msg = f"[SerialSender] ⚠️ Car {robot_id} DISCONNECTED (alive now: {sorted(current_ids)})"
+                    self._add_event(msg)
+                    print(msg, flush=True)
 
                 self._ap_status.alive_robot_ids = sorted(self._pending_alive_ids)
                 self._ap_status.last_update_time = time.time()
@@ -386,7 +406,26 @@ class SerialActionSender:
                 self._ser.write(full_packet)
                 return True
             except serial.SerialException as e:
-                print(f"Serial write error: {e}")
+                # Throttle the error message: print on first failure (so the
+                # user sees the failure mode immediately), then suppress until
+                # the summary interval elapses; emit one summary line with the
+                # aggregate count and clear the window.
+                now = time.time()
+                self._write_err_count += 1
+                if self._write_err_count == 1:
+                    print(f"[SerialSender] ⚠️ Serial write error: {e}", flush=True)
+                    self._write_err_window_start = now
+                    self._write_err_last_print = now
+                elif now - self._write_err_last_print >= self._write_err_summary_interval_sec:
+                    window = now - self._write_err_window_start
+                    print(
+                        f"[SerialSender] ⚠️ {self._write_err_count} write errors "
+                        f"in last {window:.1f}s (most recent: {e})",
+                        flush=True,
+                    )
+                    self._write_err_count = 0
+                    self._write_err_window_start = now
+                    self._write_err_last_print = now
                 return False
             except Exception as e:
                 print(f"Unexpected serial error: {e}")
